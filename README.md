@@ -1,3 +1,47 @@
+# SRS 6.0 — Dynamic Forward Fork
+
+> 基于 [ossrs/srs](https://github.com/ossrs/srs) `6.0release` 分支，新增**动态 RTMP 转发 CRUD API**。
+
+## 新增功能：动态转发 API
+
+无需修改 `srs.conf`，通过 HTTP API 实时管理 RTMP 转发规则，支持重启持久化。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/forward/` | 查询所有规则（含运行状态） |
+| GET | `/api/v1/forward/?vhost=&app=&stream=` | 查询指定流的规则 |
+| POST | `/api/v1/forward/` | 添加转发规则 |
+| DELETE | `/api/v1/forward/?id=` | 按 ID 删除 |
+| DELETE | `/api/v1/forward/?vhost=&app=&stream=&ep=` | 按端点删除 |
+
+### 快速开始
+
+```bash
+# 构建并运行
+docker build -f trunk/Dockerfile.dynamic -t srs-dynamic-forward:6.0 .
+docker run -d -p 1935:1935 -p 1985:1985 -p 8080:8080 srs-dynamic-forward:6.0
+
+# 添加转发规则
+curl -X POST http://localhost:1985/api/v1/forward/ \
+  -H "Content-Type: application/json" \
+  -d '{"vhost":"__defaultVhost__","app":"live","stream":"test","ep":"rtmp://目标IP/live/test"}'
+
+# 查询规则（status: active=转发中 / pending=等待推流）
+curl http://localhost:1985/api/v1/forward/
+
+# 删除规则
+curl -X DELETE "http://localhost:1985/api/v1/forward/?id=<id>"
+```
+
+### 特性
+- 支持完整 `rtmp://host/app/stream` 格式，目标流名可与源流不同
+- 规则持久化到 `dynamic_forward.json`，SRS 重启后自动恢复
+- 不修改 `srs.conf`，不触发全局 reload
+
+---
+
 # SRS(Simple Realtime Server)
 
 ![](http://ossrs.net/gif/v1/sls.gif?site=github.com&path=/srs/develop)
