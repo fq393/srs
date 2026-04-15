@@ -168,6 +168,16 @@ public:
     virtual srs_error_t serve_http(ISrsHttpResponseWriter* w, ISrsHttpMessage* r);
 };
 
+// Dynamic forward CRUD: GET/POST/DELETE /api/v1/forward/
+class SrsGoApiDynamicForward : public ISrsHttpHandler
+{
+public:
+    SrsGoApiDynamicForward();
+    virtual ~SrsGoApiDynamicForward();
+public:
+    virtual srs_error_t serve_http(ISrsHttpResponseWriter* w, ISrsHttpMessage* r);
+};
+
 class SrsGoApiRaw : public ISrsHttpHandler, public ISrsReloadHandler
 {
 private:

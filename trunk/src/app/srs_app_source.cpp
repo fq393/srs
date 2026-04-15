@@ -28,6 +28,7 @@ using namespace std;
 #include <srs_protocol_rtmp_msg_array.hpp>
 #include <srs_app_hds.hpp>
 #include <srs_app_statistic.hpp>
+#include <srs_app_dynamic_forward.hpp>
 #include <srs_core_autofree.hpp>
 #include <srs_protocol_utility.hpp>
 #include <srs_app_ng_exec.hpp>
@@ -1021,6 +1022,16 @@ srs_error_t SrsOriginHub::on_audio(SrsSharedPtrMessage* shared_audio)
             }
         }
     }
+
+    // copy to dynamic forwarders.
+    {
+        std::map<std::string, SrsForwarder*>::iterator it;
+        for (it = dynamic_forwarders_.begin(); it != dynamic_forwarders_.end(); ++it) {
+            if ((err = it->second->on_audio(msg)) != srs_success) {
+                return srs_error_wrap(err, "dynamic forward audio");
+            }
+        }
+    }
     
     return err;
 }
@@ -1114,6 +1125,16 @@ srs_error_t SrsOriginHub::on_video(SrsSharedPtrMessage* shared_video, bool is_se
             }
         }
     }
+
+    // copy to dynamic forwarders.
+    {
+        std::map<std::string, SrsForwarder*>::iterator it;
+        for (it = dynamic_forwarders_.begin(); it != dynamic_forwarders_.end(); ++it) {
+            if ((err = it->second->on_video(msg)) != srs_success) {
+                return srs_error_wrap(err, "dynamic forward video");
+            }
+        }
+    }
     
     return err;
 }
@@ -1158,7 +1179,22 @@ srs_error_t SrsOriginHub::on_publish()
     }
     
     is_active = true;
-    
+
+    // Restore dynamic forwarders persisted in the registry.
+    if (_srs_dynamic_forward) {
+        std::vector<SrsDynamicForwardRule> rules = _srs_dynamic_forward->query_stream(
+            req_->vhost, req_->app, req_->stream);
+        for (size_t i = 0; i < rules.size(); i++) {
+            SrsDynamicForwardRule& rule = rules[i];
+            srs_error_t e = add_dynamic_forward(rule.ep, rule.id);
+            if (e != srs_success) {
+                srs_warn("dynamic forward: restore id=%s ep=%s failed: %s",
+                    rule.id.c_str(), rule.ep.c_str(), srs_error_desc(e).c_str());
+                srs_error_reset(e);
+            }
+        }
+    }
+
     return err;
 }
 
@@ -1567,6 +1603,108 @@ void SrsOriginHub::destroy_forwarders()
         srs_freep(forwarder);
     }
     forwarders.clear();
+
+    // Also stop and clear all dynamic forwarders.
+    std::map<std::string, SrsForwarder*>::iterator dit;
+    for (dit = dynamic_forwarders_.begin(); dit != dynamic_forwarders_.end(); ++dit) {
+        dit->second->on_unpublish();
+        srs_freep(dit->second);
+    }
+    dynamic_forwarders_.clear();
+}
+
+srs_error_t SrsOriginHub::add_dynamic_forward(const std::string& ep, const std::string& id)
+{
+    srs_error_t err = srs_success;
+
+    if (!is_active) {
+        return srs_error_new(ERROR_RTMP_STREAM_NOT_FOUND,
+            "stream not active, cannot add dynamic forward to %s", ep.c_str());
+    }
+
+    // Already forwarding to this id?
+    if (dynamic_forwarders_.find(id) != dynamic_forwarders_.end()) {
+        return err; // idempotent
+    }
+
+    // Build a request pointing to the *target* server.
+    // SrsForwarder::do_cycle() calls srs_parse_hostport(ep_forward) for host:port,
+    // then srs_generate_rtmp_url(server, port, req->host, req->vhost, req->app, req->stream).
+    // So we parse a full rtmp:// URL here and set the target app/stream on a cloned req.
+    SrsRequest* treq = req_->copy();
+    std::string ep_hostport = ep; // default: treat ep as host:port
+
+    if (ep.find("rtmp://") == 0 || ep.find("rtmps://") == 0) {
+        std::string schema, target_host, target_vhost, target_app, target_stream, target_param;
+        int target_port = SRS_CONSTS_RTMP_DEFAULT_PORT;
+
+        std::string tcUrl, stream_part;
+        srs_parse_rtmp_url(ep, tcUrl, stream_part);
+        srs_discovery_tc_url(tcUrl, schema, target_host, target_vhost, target_app, target_stream, target_port, target_param);
+        if (!stream_part.empty()) {
+            target_stream = stream_part;
+        }
+
+        char portbuf[16];
+        snprintf(portbuf, sizeof(portbuf), "%d", target_port);
+        ep_hostport   = target_host + ":" + portbuf;
+
+        treq->host   = target_host;
+        treq->vhost  = target_host; // use target's own vhost
+        treq->app    = target_app;
+        treq->stream = target_stream;
+        treq->param  = target_param;
+    }
+
+    SrsForwarder* forwarder = new SrsForwarder(this);
+
+    if ((err = forwarder->initialize(treq, ep_hostport)) != srs_success) {
+        srs_freep(treq);
+        srs_freep(forwarder);
+        return srs_error_wrap(err, "init dynamic forwarder ep=%s", ep.c_str());
+    }
+    srs_freep(treq); // forwarder copied it internally
+
+    srs_utime_t queue_size = _srs_config->get_queue_length(req_->vhost);
+    forwarder->set_queue_size(queue_size);
+
+    if ((err = forwarder->on_publish()) != srs_success) {
+        srs_freep(forwarder);
+        return srs_error_wrap(err, "start dynamic forwarder ep=%s", ep.c_str());
+    }
+
+    dynamic_forwarders_[id] = forwarder;
+    srs_trace("dynamic forward: started id=%s ep=%s", id.c_str(), ep.c_str());
+
+    return err;
+}
+
+srs_error_t SrsOriginHub::remove_dynamic_forward(const std::string& id)
+{
+    srs_error_t err = srs_success;
+
+    std::map<std::string, SrsForwarder*>::iterator it = dynamic_forwarders_.find(id);
+    if (it == dynamic_forwarders_.end()) {
+        return srs_error_new(ERROR_RTMP_STREAM_NOT_FOUND,
+            "dynamic forward id=%s not running", id.c_str());
+    }
+
+    it->second->on_unpublish();
+    srs_freep(it->second);
+    dynamic_forwarders_.erase(it);
+
+    srs_trace("dynamic forward: stopped id=%s", id.c_str());
+    return err;
+}
+
+std::vector<std::string> SrsOriginHub::active_dynamic_forward_ids()
+{
+    std::vector<std::string> ids;
+    std::map<std::string, SrsForwarder*>::iterator it;
+    for (it = dynamic_forwarders_.begin(); it != dynamic_forwarders_.end(); ++it) {
+        ids.push_back(it->first);
+    }
+    return ids;
 }
 
 SrsMetaCache::SrsMetaCache()

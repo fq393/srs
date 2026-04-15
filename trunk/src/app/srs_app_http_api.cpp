@@ -30,6 +30,7 @@ using namespace std;
 #include <srs_protocol_amf0.hpp>
 #include <srs_protocol_utility.hpp>
 #include <srs_app_coworkers.hpp>
+#include <srs_app_dynamic_forward.hpp>
 
 #ifdef SRS_VALGRIND
 #include <valgrind/valgrind.h>
@@ -879,6 +880,179 @@ srs_error_t SrsGoApiClients::serve_http(ISrsHttpResponseWriter* w, ISrsHttpMessa
         return srs_go_http_error(w, SRS_CONSTS_HTTP_MethodNotAllowed);
     }
     
+    return srs_api_response(w, r, obj->dumps());
+}
+
+SrsGoApiDynamicForward::SrsGoApiDynamicForward()
+{
+}
+
+SrsGoApiDynamicForward::~SrsGoApiDynamicForward()
+{
+}
+
+srs_error_t SrsGoApiDynamicForward::serve_http(ISrsHttpResponseWriter* w, ISrsHttpMessage* r)
+{
+    srs_error_t err = srs_success;
+
+    SrsUniquePtr<SrsJsonObject> obj(SrsJsonAny::object());
+    obj->set("code", SrsJsonAny::integer(ERROR_SUCCESS));
+
+    if (r->is_http_get()) {
+        // GET /api/v1/forward/?vhost=&app=&stream=  (query single stream)
+        // GET /api/v1/forward/                       (query all)
+        std::string vhost = r->query_get("vhost");
+        std::string app   = r->query_get("app");
+        std::string stream = r->query_get("stream");
+
+        std::vector<SrsDynamicForwardRule> rules;
+        if (!vhost.empty() && !app.empty() && !stream.empty()) {
+            rules = _srs_dynamic_forward->query_stream(vhost, app, stream);
+        } else {
+            rules = _srs_dynamic_forward->query_all();
+        }
+
+        // Enrich with runtime status from live hub.
+        SrsJsonArray* data = SrsJsonAny::array();
+        obj->set("rules", data);
+
+        for (size_t i = 0; i < rules.size(); i++) {
+            SrsDynamicForwardRule& rule = rules[i];
+            SrsJsonObject* item = SrsJsonAny::object();
+            item->set("id",         SrsJsonAny::str(rule.id.c_str()));
+            item->set("vhost",      SrsJsonAny::str(rule.vhost.c_str()));
+            item->set("app",        SrsJsonAny::str(rule.app.c_str()));
+            item->set("stream",     SrsJsonAny::str(rule.stream.c_str()));
+            item->set("ep",         SrsJsonAny::str(rule.ep.c_str()));
+            item->set("created_at", SrsJsonAny::str(rule.created_at.c_str()));
+
+            // Check if the forwarder is actually running.
+            SrsRequest req;
+            req.vhost  = rule.vhost;
+            req.app    = rule.app;
+            req.stream = rule.stream;
+            SrsSharedPtr<SrsLiveSource> source = _srs_sources->fetch(&req);
+            bool active = false;
+            if (source.get()) {
+                SrsOriginHub* hub = source->get_hub();
+                if (hub) {
+                    std::vector<std::string> ids = hub->active_dynamic_forward_ids();
+                    for (size_t j = 0; j < ids.size(); j++) {
+                        if (ids[j] == rule.id) { active = true; break; }
+                    }
+                }
+            }
+            item->set("status", SrsJsonAny::str(active ? "active" : "pending"));
+            data->add(item);
+        }
+
+    } else if (r->is_http_post()) {
+        // POST /api/v1/forward/
+        // Body: {"vhost":"..","app":"..","stream":"..","ep":"rtmp://.."}
+        std::string body;
+        if ((err = r->body_read_all(body)) != srs_success) {
+            return srs_error_wrap(err, "read body");
+        }
+
+        SrsJsonAny* any = SrsJsonAny::loads(body);
+        if (!any || !any->is_object()) {
+            srs_freep(any);
+            return srs_api_response_code(w, r, ERROR_JSON_LOADS);
+        }
+        SrsUniquePtr<SrsJsonAny> auto_free(any);
+        SrsJsonObject* req_obj = any->to_object();
+
+        SrsDynamicForwardRule rule;
+        SrsJsonAny* p;
+        if ((p = req_obj->ensure_property_string("vhost")))  rule.vhost  = p->to_str();
+        if ((p = req_obj->ensure_property_string("app")))    rule.app    = p->to_str();
+        if ((p = req_obj->ensure_property_string("stream"))) rule.stream = p->to_str();
+        if ((p = req_obj->ensure_property_string("ep")))     rule.ep     = p->to_str();
+
+        if (rule.vhost.empty() || rule.app.empty() || rule.stream.empty() || rule.ep.empty()) {
+            return srs_api_response_code(w, r, SRS_CONSTS_HTTP_BadRequest);
+        }
+
+        // Persist first so we have the generated id.
+        if ((err = _srs_dynamic_forward->add(rule)) != srs_success) {
+            return srs_error_wrap(err, "registry add");
+        }
+
+        // If stream is live right now, start the forwarder immediately.
+        SrsRequest sreq;
+        sreq.vhost  = rule.vhost;
+        sreq.app    = rule.app;
+        sreq.stream = rule.stream;
+        SrsSharedPtr<SrsLiveSource> source = _srs_sources->fetch(&sreq);
+        if (source.get() && source->get_hub()) {
+            srs_error_t e = source->get_hub()->add_dynamic_forward(rule.ep, rule.id);
+            if (e != srs_success) {
+                // Non-fatal: rule is persisted, forwarder starts on next publish.
+                srs_warn("dynamic forward: stream live but start failed: %s",
+                    srs_error_desc(e).c_str());
+                srs_error_reset(e);
+            }
+        }
+
+        SrsJsonObject* data = SrsJsonAny::object();
+        obj->set("data", data);
+        data->set("id", SrsJsonAny::str(rule.id.c_str()));
+
+    } else if (r->is_http_delete()) {
+        // DELETE /api/v1/forward/?id=xxx
+        // DELETE /api/v1/forward/?vhost=&app=&stream=&ep=rtmp://..
+        std::string id     = r->query_get("id");
+        std::string vhost  = r->query_get("vhost");
+        std::string app    = r->query_get("app");
+        std::string stream = r->query_get("stream");
+        std::string ep     = r->query_get("ep");
+
+        SrsDynamicForwardRule found;
+        bool has_found = false;
+
+        if (!id.empty()) {
+            // Find rule by id to get ep/vhost/app/stream for hub stop.
+            std::vector<SrsDynamicForwardRule> all = _srs_dynamic_forward->query_all();
+            for (size_t i = 0; i < all.size(); i++) {
+                if (all[i].id == id) { found = all[i]; has_found = true; break; }
+            }
+            if ((err = _srs_dynamic_forward->remove_by_id(id)) != srs_success) {
+                return srs_error_wrap(err, "registry remove");
+            }
+        } else if (!vhost.empty() && !app.empty() && !stream.empty() && !ep.empty()) {
+            std::vector<SrsDynamicForwardRule> rules =
+                _srs_dynamic_forward->query_stream(vhost, app, stream);
+            for (size_t i = 0; i < rules.size(); i++) {
+                if (rules[i].ep == ep) { found = rules[i]; has_found = true; break; }
+            }
+            if ((err = _srs_dynamic_forward->remove_by_ep(vhost, app, stream, ep)) != srs_success) {
+                return srs_error_wrap(err, "registry remove by ep");
+            }
+        } else {
+            return srs_api_response_code(w, r, SRS_CONSTS_HTTP_BadRequest);
+        }
+
+        // Stop the live forwarder if running.
+        if (has_found) {
+            SrsRequest sreq;
+            sreq.vhost  = found.vhost;
+            sreq.app    = found.app;
+            sreq.stream = found.stream;
+            SrsSharedPtr<SrsLiveSource> source = _srs_sources->fetch(&sreq);
+            if (source.get() && source->get_hub()) {
+                srs_error_t e = source->get_hub()->remove_dynamic_forward(found.id);
+                if (e != srs_success) {
+                    srs_warn("dynamic forward: stop id=%s failed: %s",
+                        found.id.c_str(), srs_error_desc(e).c_str());
+                    srs_error_reset(e);
+                }
+            }
+        }
+
+    } else {
+        return srs_go_http_error(w, SRS_CONSTS_HTTP_MethodNotAllowed);
+    }
+
     return srs_api_response(w, r, obj->dumps());
 }
 

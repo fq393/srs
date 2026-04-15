@@ -338,8 +338,10 @@ private:
 #endif
     // nginx-rtmp exec feature.
     SrsNgExec* ng_exec;
-    // To forward stream to other servers
+    // To forward stream to other servers (static, from config)
     std::vector<SrsForwarder*> forwarders;
+    // Dynamic forwarders added via API: id -> SrsForwarder*
+    std::map<std::string, SrsForwarder*> dynamic_forwarders_;
 public:
     SrsOriginHub();
     virtual ~SrsOriginHub();
@@ -386,6 +388,15 @@ public:
     virtual srs_error_t on_reload_vhost_dvr(std::string vhost);
     virtual srs_error_t on_reload_vhost_transcode(std::string vhost);
     virtual srs_error_t on_reload_vhost_exec(std::string vhost);
+// Dynamic forward API
+public:
+    // Add a dynamic forwarder by endpoint (e.g. "rtmp://1.2.3.4/live/stream").
+    // Returns the rule id used to identify this forwarder.
+    virtual srs_error_t add_dynamic_forward(const std::string& ep, const std::string& id);
+    // Remove a dynamic forwarder by rule id.
+    virtual srs_error_t remove_dynamic_forward(const std::string& id);
+    // Return active dynamic forwarder ids (those currently running).
+    virtual std::vector<std::string> active_dynamic_forward_ids();
 private:
     virtual srs_error_t create_forwarders();
     virtual srs_error_t create_backend_forwarders(bool& applied);
@@ -606,6 +617,8 @@ public:
     virtual void on_edge_proxy_unpublish();
 public:
     virtual std::string get_curr_origin();
+    // Return the origin hub for dynamic forward API access.
+    virtual SrsOriginHub* get_hub() { return hub; }
 };
 
 #endif

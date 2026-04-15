@@ -1,0 +1,49 @@
+# Build stage
+FROM docker.1ms.run/ossrs/srs:6 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Shanghai
+
+# Replace apt sources with Aliyun mirror (arm64/ports, http to avoid cert issues)
+RUN sed -i 's|http://ports.ubuntu.com/ubuntu-ports|http://mirrors.aliyun.com/ubuntu-ports|g' /etc/apt/sources.list && \
+    apt-get update && apt-get install -y \
+        build-essential gcc g++ make \
+        libssl-dev autoconf automake libtool pkg-config \
+        tzdata unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /srs
+WORKDIR /srs/trunk
+RUN ./configure --srt=off --gb28181=off --rtc=off --nasm=off --srtp-nasm=off && make -j$(nproc)
+
+# Runtime stage
+FROM docker.1ms.run/ossrs/srs:6
+
+COPY --from=builder /srs/trunk/objs/srs /usr/local/srs/objs/srs
+
+RUN cat > /usr/local/srs/conf/srs.conf << 'EOF'
+listen              1935;
+max_connections     1000;
+daemon              off;
+srs_log_tank        console;
+pid                 /usr/local/srs/objs/srs.pid;
+
+http_api {
+    enabled         on;
+    listen          1985;
+}
+
+http_server {
+    enabled         on;
+    listen          8080;
+}
+
+vhost __defaultVhost__ {
+    forward {
+        enabled     off;
+    }
+}
+EOF
+
+EXPOSE 1935 1985 8080
+
+ENTRYPOINT ["/usr/local/srs/objs/srs", "-c", "/usr/local/srs/conf/srs.conf"]

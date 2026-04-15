@@ -37,6 +37,7 @@ using namespace std;
 #include <srs_protocol_log.hpp>
 #include <srs_app_latest_version.hpp>
 #include <srs_app_conn.hpp>
+#include <srs_app_dynamic_forward.hpp>
 #ifdef SRS_RTC
 #include <srs_app_rtc_network.hpp>
 #include <srs_app_rtc_server.hpp>
@@ -534,7 +535,22 @@ srs_error_t SrsServer::initialize()
     if ((err = http_server->initialize()) != srs_success) {
         return srs_error_wrap(err, "http server initialize");
     }
-    
+
+    // Init dynamic forward registry and load persisted rules.
+    _srs_dynamic_forward = new SrsDynamicForwardRegistry();
+    std::string df_path = _srs_config->get_pid_file();
+    // Place the JSON file alongside the pid file directory.
+    size_t pos = df_path.rfind('/');
+    if (pos != std::string::npos) {
+        df_path = df_path.substr(0, pos + 1) + "dynamic_forward.json";
+    } else {
+        df_path = "./dynamic_forward.json";
+    }
+    if ((err = _srs_dynamic_forward->load(df_path)) != srs_success) {
+        srs_warn("dynamic forward: load failed (non-fatal): %s", srs_error_desc(err).c_str());
+        srs_error_reset(err);
+    }
+
     return err;
 }
 
@@ -744,6 +760,9 @@ srs_error_t SrsServer::http_handle()
     }
     if ((err = http_api_mux->handle("/api/v1/clients/", new SrsGoApiClients())) != srs_success) {
         return srs_error_wrap(err, "handle clients");
+    }
+    if ((err = http_api_mux->handle("/api/v1/forward/", new SrsGoApiDynamicForward())) != srs_success) {
+        return srs_error_wrap(err, "handle forward");
     }
     if ((err = http_api_mux->handle("/api/v1/raw", new SrsGoApiRaw(this))) != srs_success) {
         return srs_error_wrap(err, "handle raw");
