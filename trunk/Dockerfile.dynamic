@@ -30,16 +30,29 @@ pid                 /data/srs/srs.pid;
 http_api {
     enabled         on;
     listen          1985;
+    crossdomain     on;
+    raw_api {
+        enabled      on;
+        allow_reload on;
+        allow_query  on;
+        allow_update on;
+    }
 }
 
 http_server {
     enabled         on;
     listen          8080;
+    dir             ./objs/nginx/html;
+    crossdomain     on;
 }
 
 vhost __defaultVhost__ {
-    forward {
-        enabled     off;
+    hls {
+        enabled     on;
+    }
+    http_remux {
+        enabled     on;
+        mount       [vhost]/[app]/[stream].flv;
     }
 }
 EOF
