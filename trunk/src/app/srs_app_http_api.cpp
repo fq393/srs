@@ -1017,6 +1017,10 @@ srs_error_t SrsGoApiDynamicForward::serve_http(ISrsHttpResponseWriter* w, ISrsHt
             for (size_t i = 0; i < all.size(); i++) {
                 if (all[i].id == id) { found = all[i]; has_found = true; break; }
             }
+            if (!has_found) {
+                // Idempotent: rule already gone, treat as success.
+                return srs_api_response(w, r, obj->dumps());
+            }
             if ((err = _srs_dynamic_forward->remove_by_id(id)) != srs_success) {
                 return srs_error_wrap(err, "registry remove");
             }
@@ -1025,6 +1029,10 @@ srs_error_t SrsGoApiDynamicForward::serve_http(ISrsHttpResponseWriter* w, ISrsHt
                 _srs_dynamic_forward->query_stream(vhost, app, stream);
             for (size_t i = 0; i < rules.size(); i++) {
                 if (rules[i].ep == ep) { found = rules[i]; has_found = true; break; }
+            }
+            if (!has_found) {
+                // Idempotent: rule already gone, treat as success.
+                return srs_api_response(w, r, obj->dumps());
             }
             if ((err = _srs_dynamic_forward->remove_by_ep(vhost, app, stream, ep)) != srs_success) {
                 return srs_error_wrap(err, "registry remove by ep");
@@ -1643,8 +1651,10 @@ srs_error_t SrsGoApiDynamicIngest::serve_http(ISrsHttpResponseWriter* w, ISrsHtt
 
         _srs_dynamic_ingest_mgr->stop_worker(id);
 
-        if ((err = _srs_dynamic_ingest->remove_by_id(id)) != srs_success) {
-            return srs_error_wrap(err, "remove ingest rule");
+        srs_error_t e = _srs_dynamic_ingest->remove_by_id(id);
+        if (e != srs_success) {
+            // Idempotent: rule already gone, treat as success.
+            srs_freep(e);
         }
 
         return srs_api_response_code(w, r, ERROR_SUCCESS);
