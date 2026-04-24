@@ -215,7 +215,7 @@ docker run -d \
   harbor.zmg.com.cn/library/newingest-srs:latest
 ```
 
-> 挂载 `/data/srs` 后 `dynamic_ingest.json` / `dynamic_forward.json` 持久化到宿主机，容器重启后规则自动恢复、ffmpeg 进程自动重拉。
+> `srs.conf` 已打包进镜像，无需外部挂载。挂载 `/data/srs` 后 `dynamic_ingest.json` / `dynamic_forward.json` 持久化到宿主机，容器重启后规则自动恢复、ffmpeg 进程自动重拉。
 
 ---
 
