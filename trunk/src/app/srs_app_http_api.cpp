@@ -31,6 +31,7 @@ using namespace std;
 #include <srs_protocol_utility.hpp>
 #include <srs_app_coworkers.hpp>
 #include <srs_app_dynamic_forward.hpp>
+#include <srs_app_dynamic_ingest.hpp>
 
 #ifdef SRS_VALGRIND
 #include <valgrind/valgrind.h>
@@ -1546,3 +1547,110 @@ srs_error_t SrsGoApiMetrics::serve_http(ISrsHttpResponseWriter* w, ISrsHttpMessa
 
     return srs_api_response(w, r, ss.str());
 }
+
+#ifdef SRS_FFMPEG_STUB
+
+SrsGoApiDynamicIngest::SrsGoApiDynamicIngest()
+{
+}
+
+SrsGoApiDynamicIngest::~SrsGoApiDynamicIngest()
+{
+}
+
+srs_error_t SrsGoApiDynamicIngest::serve_http(ISrsHttpResponseWriter* w, ISrsHttpMessage* r)
+{
+    srs_error_t err = srs_success;
+
+    if (r->is_http_get()) {
+        // GET /api/v1/ingest/  — list all rules with running status
+        std::vector<SrsDynamicIngestRule> rules = _srs_dynamic_ingest->query_all();
+
+        SrsJsonObject* data = SrsJsonAny::object();
+        SrsUniquePtr<SrsJsonObject> auto_free(data);
+
+        SrsJsonArray* arr = SrsJsonAny::array();
+        data->set("rules", arr);
+
+        for (size_t i = 0; i < rules.size(); i++) {
+            SrsDynamicIngestRule& rule = rules[i];
+            SrsJsonObject* item = SrsJsonAny::object();
+            item->set("id",         SrsJsonAny::str(rule.id.c_str()));
+            item->set("src_url",    SrsJsonAny::str(rule.src_url.c_str()));
+            item->set("dst_url",    SrsJsonAny::str(rule.dst_url.c_str()));
+            item->set("created_at", SrsJsonAny::str(rule.created_at.c_str()));
+            item->set("running",    SrsJsonAny::boolean(_srs_dynamic_ingest_mgr->is_running(rule.id)));
+            arr->add(item);
+        }
+
+        return srs_api_response(w, r, data->dumps());
+    }
+
+    if (r->is_http_post()) {
+        // POST /api/v1/ingest/
+        // Body: {"src_url":"rtmp://...","dst_url":"rtmp://..."}
+        std::string body;
+        if ((err = r->body_read_all(body)) != srs_success) {
+            return srs_error_wrap(err, "read body");
+        }
+
+        SrsJsonAny* any = SrsJsonAny::loads(body);
+        if (!any) {
+            return srs_api_response_code(w, r, ERROR_JSON_LOADS);
+        }
+        SrsUniquePtr<SrsJsonAny> auto_free(any);
+
+        if (!any->is_object()) {
+            return srs_api_response_code(w, r, ERROR_JSON_LOADS);
+        }
+        SrsJsonObject* obj = any->to_object();
+
+        SrsDynamicIngestRule rule;
+        SrsJsonAny* p;
+        if ((p = obj->ensure_property_string("src_url"))) rule.src_url = p->to_str();
+        if ((p = obj->ensure_property_string("dst_url"))) rule.dst_url = p->to_str();
+
+        if (rule.src_url.empty() || rule.dst_url.empty()) {
+            return srs_api_response_code(w, r, ERROR_REQUEST_DATA);
+        }
+
+        if ((err = _srs_dynamic_ingest->add(rule)) != srs_success) {
+            return srs_error_wrap(err, "add ingest rule");
+        }
+
+        if ((err = _srs_dynamic_ingest_mgr->start_worker(rule)) != srs_success) {
+            srs_warn("dingest: start worker for %s failed: %s", rule.id.c_str(), srs_error_desc(err).c_str());
+            srs_freep(err);
+            // Rule is persisted; worker will not run. Client can DELETE and retry.
+        }
+
+        SrsJsonObject* data = SrsJsonAny::object();
+        SrsUniquePtr<SrsJsonObject> auto_free2(data);
+        data->set("id",         SrsJsonAny::str(rule.id.c_str()));
+        data->set("src_url",    SrsJsonAny::str(rule.src_url.c_str()));
+        data->set("dst_url",    SrsJsonAny::str(rule.dst_url.c_str()));
+        data->set("created_at", SrsJsonAny::str(rule.created_at.c_str()));
+
+        return srs_api_response(w, r, data->dumps());
+    }
+
+    if (r->is_http_delete()) {
+        // DELETE /api/v1/ingest/?id=xxx
+        std::string id = r->query_get("id");
+        if (id.empty()) {
+            return srs_api_response_code(w, r, ERROR_REQUEST_DATA);
+        }
+
+        _srs_dynamic_ingest_mgr->stop_worker(id);
+
+        if ((err = _srs_dynamic_ingest->remove_by_id(id)) != srs_success) {
+            return srs_error_wrap(err, "remove ingest rule");
+        }
+
+        return srs_api_response_code(w, r, ERROR_SUCCESS);
+    }
+
+    return srs_api_response_code(w, r, ERROR_HTTP_HANDLER_INVALID);
+}
+
+#endif // SRS_FFMPEG_STUB

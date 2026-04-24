@@ -1,10 +1,14 @@
-# SRS 6.0 — Dynamic Forward Fork
+# SRS 6.0 — Dynamic Forward & Dynamic Ingest Fork
 
-> 基于 [ossrs/srs](https://github.com/ossrs/srs) `6.0release` 分支，新增**动态 RTMP 转发 CRUD API**。
+> 基于 [ossrs/srs](https://github.com/ossrs/srs) `6.0release` 分支，新增两个动态 CRUD API：
+> - **动态转发（Dynamic Forward）**：将 SRS 正在接收的流实时转推到外部地址
+> - **动态拉流（Dynamic Ingest）**：从外部拉取 RTMP 流并转推到目标地址，规则持久化，重启自动恢复
 
-## 新增功能：动态转发 API
+---
 
-无需修改 `srs.conf`，通过 HTTP API 实时管理 RTMP 转发规则，支持重启持久化。
+## 功能一：动态转发 API `/api/v1/forward/`
+
+无需修改 `srs.conf`，将 SRS **已在接收的推流**实时转发到其他 RTMP 地址。
 
 ### 接口
 
@@ -13,32 +17,243 @@
 | GET | `/api/v1/forward/` | 查询所有规则（含运行状态） |
 | GET | `/api/v1/forward/?vhost=&app=&stream=` | 查询指定流的规则 |
 | POST | `/api/v1/forward/` | 添加转发规则 |
-| DELETE | `/api/v1/forward/?id=` | 按 ID 删除 |
-| DELETE | `/api/v1/forward/?vhost=&app=&stream=&ep=` | 按端点删除 |
+| DELETE | `/api/v1/forward/?id=<id>` | 按 ID 删除 |
+| DELETE | `/api/v1/forward/?vhost=&app=&stream=&ep=<rtmp://...>` | 按端点删除 |
 
-### 快速开始
+### 请求/响应示例
 
+**POST** 添加规则：
 ```bash
-# 构建并运行
-docker build -f trunk/Dockerfile.dynamic -t srs-dynamic-forward:6.0 .
-docker run -d -p 1935:1935 -p 1985:1985 -p 8080:8080 srs-dynamic-forward:6.0
-
-# 添加转发规则
 curl -X POST http://localhost:1985/api/v1/forward/ \
   -H "Content-Type: application/json" \
-  -d '{"vhost":"__defaultVhost__","app":"live","stream":"test","ep":"rtmp://目标IP/live/test"}'
+  -d '{
+    "vhost":  "__defaultVhost__",
+    "app":    "live",
+    "stream": "test",
+    "ep":     "rtmp://目标IP/live/test"
+  }'
+```
+```json
+{
+  "code": 0,
+  "data": {
+    "id": "a1b2c3d4e5f6a7b8"
+  }
+}
+```
 
-# 查询规则（status: active=转发中 / pending=等待推流）
+> 请求字段说明：
+> - `vhost`：虚拟主机，通常填 `__defaultVhost__`
+> - `app`：推流 app 名，如 `live`
+> - `stream`：推流流名，如 `test`
+> - `ep`：目标转发地址，完整 RTMP URL
+
+**GET** 查询所有规则：
+```bash
 curl http://localhost:1985/api/v1/forward/
+```
+```json
+{
+  "code": 0,
+  "rules": [
+    {
+      "id":         "a1b2c3d4e5f6a7b8",
+      "vhost":      "__defaultVhost__",
+      "app":        "live",
+      "stream":     "test",
+      "ep":         "rtmp://目标IP/live/test",
+      "created_at": "2026-04-24T05:30:00Z",
+      "status":     "active"
+    }
+  ]
+}
+```
 
-# 删除规则
-curl -X DELETE "http://localhost:1985/api/v1/forward/?id=<id>"
+> `status: "active"` 表示该流当前正在推流，转发已激活；`"pending"` 表示规则已注册但流尚未推入。
+
+**GET** 查询指定流的规则：
+```bash
+curl "http://localhost:1985/api/v1/forward/?vhost=__defaultVhost__&app=live&stream=test"
+```
+返回格式同上，仅包含该流的规则。
+
+**DELETE** 按 ID 删除：
+```bash
+curl -X DELETE "http://localhost:1985/api/v1/forward/?id=a1b2c3d4e5f6a7b8"
+```
+```json
+{"code": 0}
+```
+
+**DELETE** 按端点删除：
+```bash
+curl -X DELETE "http://localhost:1985/api/v1/forward/?vhost=__defaultVhost__&app=live&stream=test&ep=rtmp://目标IP/live/test"
+```
+```json
+{"code": 0}
 ```
 
 ### 特性
-- 支持完整 `rtmp://host/app/stream` 格式，目标流名可与源流不同
-- 规则持久化到 `dynamic_forward.json`，SRS 重启后自动恢复
+- 规则持久化到 `dynamic_forward.json`（与 pid 文件同目录），SRS 重启后自动恢复并重新挂载
 - 不修改 `srs.conf`，不触发全局 reload
+- 支持同一条流同时转发到多个目标
+
+---
+
+## 功能二：动态拉流 API `/api/v1/ingest/`
+
+通过 HTTP API 动态添加拉流任务：SRS 使用内置 ffmpeg **从外部 RTMP 地址拉流**，并转推到目标地址。适用于将其他服务器的直播流中转/转推到指定目标。
+
+```
+外部源流  ──ffmpeg拉取──▶  SRS(ffmpeg进程)  ──推流──▶  目标地址
+rtmp://src/live/xxx                            rtmp://dst/live/yyy
+```
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/ingest/` | 查询所有拉流规则（含运行状态） |
+| POST | `/api/v1/ingest/` | 添加拉流转推任务 |
+| DELETE | `/api/v1/ingest/?id=<id>` | 停止并删除任务 |
+
+### 请求/响应示例
+
+**POST** 添加拉流转推任务：
+```bash
+curl -X POST http://localhost:1985/api/v1/ingest/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "src_url": "rtmp://10.20.40.10/live/cctv1hd",
+    "dst_url": "rtmp://rtmp-qukan.cztv.com/live/1776997593535240"
+  }'
+```
+```json
+{
+  "id":         "670d44ea4ff67cac",
+  "src_url":    "rtmp://10.20.40.10/live/cctv1hd",
+  "dst_url":    "rtmp://rtmp-qukan.cztv.com/live/1776997593535240",
+  "created_at": "2026-04-24T05:42:16Z"
+}
+```
+
+**GET** 查询所有任务：
+```bash
+curl http://localhost:1985/api/v1/ingest/
+```
+```json
+{
+  "rules": [
+    {
+      "id":         "670d44ea4ff67cac",
+      "src_url":    "rtmp://10.20.40.10/live/cctv1hd",
+      "dst_url":    "rtmp://rtmp-qukan.cztv.com/live/1776997593535240",
+      "created_at": "2026-04-24T05:42:16Z",
+      "running":    true
+    }
+  ]
+}
+```
+
+> `running: true` 表示 ffmpeg 进程正在运行；源流中断时会自动重试（3 秒间隔）。
+
+**DELETE** 停止并删除任务：
+```bash
+curl -X DELETE "http://localhost:1985/api/v1/ingest/?id=670d44ea4ff67cac"
+```
+```json
+{"code": 0}
+```
+
+### 特性
+- 规则持久化到 `dynamic_ingest.json`（与 pid 文件同目录），**SRS 重启后自动恢复并重启 ffmpeg 进程**
+- 源流断流或 ffmpeg 异常退出后，**自动重试**（3 秒间隔），无需人工干预
+- 优先使用 SRS 内置 ffmpeg（`/usr/local/srs/objs/ffmpeg/bin/ffmpeg`），回退到系统 ffmpeg
+- 使用 `-c copy` 模式，无转码开销，纯转发
+- 不修改 `srs.conf`
+
+### 注意事项
+- 目标地址如有推流鉴权（token/sign），需在 `dst_url` 中携带，例如：
+  `rtmp://push.example.com/live/streamkey?auth=xxxxx`
+- 同一目标地址只允许一路推流，重复推流会被目标服务器拒绝
+
+---
+
+## 部署
+
+### Harbor 镜像
+
+```
+harbor.zmg.com.cn/library/newingest-srs:latest
+```
+
+### 端口说明
+
+| 端口 | 用途 | 是否必须 |
+|------|------|---------|
+| `1935` | RTMP 推拉流 | ✅ 必须 |
+| `1985` | HTTP API（ingest / forward 接口） | ✅ 必须 |
+| `8080` | HTTP-FLV / HLS 播放 | 按需 |
+
+### 目录挂载说明
+
+| 容器内路径 | 用途 | 建议 |
+|-----------|------|------|
+| `/usr/local/srs/objs/` | 存放 `dynamic_ingest.json` 和 `dynamic_forward.json`（持久化规则） | ✅ 建议挂载，否则容器重启后规则丢失 |
+| `/usr/local/srs/conf/` | SRS 配置文件 | 按需，如需自定义配置 |
+| `/usr/local/srs/logs/` | 日志输出 | 按需 |
+
+### 推荐运行命令
+
+```bash
+docker run -d \
+  --name newingest-srs \
+  --restart always \
+  -p 1935:1935 \
+  -p 1985:1985 \
+  -p 8080:8080 \
+  -v /data/srs/objs:/usr/local/srs/objs \
+  harbor.zmg.com.cn/library/newingest-srs:latest
+```
+
+> `/data/srs/objs` 可替换为宿主机上任意目录。挂载后 `dynamic_ingest.json` / `dynamic_forward.json` 落盘到宿主机，容器重启后规则自动恢复、ffmpeg 进程自动重拉。
+
+---
+
+## 快速开始
+
+```bash
+# 构建镜像
+docker build -f trunk/Dockerfile.dynamic -t srs-dynamic:6.0 .
+
+# 启动
+docker run -d -p 1935:1935 -p 1985:1985 -p 8080:8080 srs-dynamic:6.0
+
+# 添加拉流转推任务
+curl -X POST http://localhost:1985/api/v1/ingest/ \
+  -H "Content-Type: application/json" \
+  -d '{"src_url":"rtmp://源地址/live/stream","dst_url":"rtmp://目标地址/live/stream"}'
+
+# 查询任务状态
+curl http://localhost:1985/api/v1/ingest/
+
+# 删除任务
+curl -X DELETE "http://localhost:1985/api/v1/ingest/?id=<id>"
+```
+
+---
+
+## 涉及改动的源文件
+
+| 文件 | 改动说明 |
+|------|---------|
+| `trunk/src/app/srs_app_dynamic_forward.cpp/hpp` | 新增，动态转发规则注册表 |
+| `trunk/src/app/srs_app_dynamic_ingest.cpp/hpp` | 新增，动态拉流规则注册表 + ffmpeg worker 管理 |
+| `trunk/src/app/srs_app_http_api.cpp/hpp` | 新增两个 HTTP API handler |
+| `trunk/src/app/srs_app_server.cpp` | 注册路由、启动时加载持久化规则并恢复 worker |
+| `trunk/src/app/srs_app_source.cpp/hpp` | 扩展 source hub 支持动态 forward 挂载/卸载 |
+| `trunk/configure` | 将新源文件加入编译列表 |
+| `trunk/Dockerfile.dynamic` | 精简 Docker 构建文件（仅含本分支功能） |
 
 ---
 

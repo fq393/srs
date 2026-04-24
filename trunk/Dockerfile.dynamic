@@ -1,5 +1,5 @@
 # Build stage
-FROM docker.1ms.run/ossrs/srs:6 AS builder
+FROM --platform=linux/amd64 docker.1ms.run/ossrs/srs:6 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Shanghai
 
@@ -16,7 +16,7 @@ WORKDIR /srs/trunk
 RUN ./configure --srt=off --gb28181=off --rtc=off --nasm=off --srtp-nasm=off && make -j$(nproc)
 
 # Runtime stage
-FROM docker.1ms.run/ossrs/srs:6
+FROM --platform=linux/amd64 docker.1ms.run/ossrs/srs:6
 
 COPY --from=builder /srs/trunk/objs/srs /usr/local/srs/objs/srs
 

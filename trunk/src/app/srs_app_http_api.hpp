@@ -178,6 +178,16 @@ public:
     virtual srs_error_t serve_http(ISrsHttpResponseWriter* w, ISrsHttpMessage* r);
 };
 
+// Dynamic ingest CRUD: GET/POST/DELETE /api/v1/ingest/
+class SrsGoApiDynamicIngest : public ISrsHttpHandler
+{
+public:
+    SrsGoApiDynamicIngest();
+    virtual ~SrsGoApiDynamicIngest();
+public:
+    virtual srs_error_t serve_http(ISrsHttpResponseWriter* w, ISrsHttpMessage* r);
+};
+
 class SrsGoApiRaw : public ISrsHttpHandler, public ISrsReloadHandler
 {
 private:

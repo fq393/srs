@@ -38,6 +38,7 @@ using namespace std;
 #include <srs_app_latest_version.hpp>
 #include <srs_app_conn.hpp>
 #include <srs_app_dynamic_forward.hpp>
+#include <srs_app_dynamic_ingest.hpp>
 #ifdef SRS_RTC
 #include <srs_app_rtc_network.hpp>
 #include <srs_app_rtc_server.hpp>
@@ -551,6 +552,34 @@ srs_error_t SrsServer::initialize()
         srs_error_reset(err);
     }
 
+#ifdef SRS_FFMPEG_STUB
+    // Init dynamic ingest registry and manager.
+    _srs_dynamic_ingest = new SrsDynamicIngestRegistry();
+    _srs_dynamic_ingest_mgr = new SrsDynamicIngestManager();
+    std::string di_path = _srs_config->get_pid_file();
+    size_t di_pos = di_path.rfind('/');
+    if (di_pos != std::string::npos) {
+        di_path = di_path.substr(0, di_pos + 1) + "dynamic_ingest.json";
+    } else {
+        di_path = "./dynamic_ingest.json";
+    }
+    if ((err = _srs_dynamic_ingest->load(di_path)) != srs_success) {
+        srs_warn("dynamic ingest: load failed (non-fatal): %s", srs_error_desc(err).c_str());
+        srs_error_reset(err);
+    }
+    // Restart workers for persisted rules.
+    {
+        std::vector<SrsDynamicIngestRule> rules = _srs_dynamic_ingest->query_all();
+        for (size_t i = 0; i < rules.size(); i++) {
+            srs_error_t e = _srs_dynamic_ingest_mgr->start_worker(rules[i]);
+            if (e != srs_success) {
+                srs_warn("dynamic ingest: restart worker %s failed: %s", rules[i].id.c_str(), srs_error_desc(e).c_str());
+                srs_freep(e);
+            }
+        }
+    }
+#endif
+
     return err;
 }
 
@@ -764,6 +793,11 @@ srs_error_t SrsServer::http_handle()
     if ((err = http_api_mux->handle("/api/v1/forward/", new SrsGoApiDynamicForward())) != srs_success) {
         return srs_error_wrap(err, "handle forward");
     }
+#ifdef SRS_FFMPEG_STUB
+    if ((err = http_api_mux->handle("/api/v1/ingest/", new SrsGoApiDynamicIngest())) != srs_success) {
+        return srs_error_wrap(err, "handle ingest");
+    }
+#endif
     if ((err = http_api_mux->handle("/api/v1/raw", new SrsGoApiRaw(this))) != srs_success) {
         return srs_error_wrap(err, "handle raw");
     }
