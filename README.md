@@ -199,9 +199,8 @@ harbor.zmg.com.cn/library/newingest-srs:latest
 
 | 容器内路径 | 用途 | 建议 |
 |-----------|------|------|
-| `/usr/local/srs/objs/` | 存放 `dynamic_ingest.json` 和 `dynamic_forward.json`（持久化规则） | ✅ 建议挂载，否则容器重启后规则丢失 |
+| `/data/srs/` | 存放 `dynamic_ingest.json`、`dynamic_forward.json`、`srs.pid` | ✅ 建议挂载，否则容器重启后规则丢失 |
 | `/usr/local/srs/conf/` | SRS 配置文件 | 按需，如需自定义配置 |
-| `/usr/local/srs/logs/` | 日志输出 | 按需 |
 
 ### 推荐运行命令
 
@@ -212,11 +211,11 @@ docker run -d \
   -p 1935:1935 \
   -p 1985:1985 \
   -p 8080:8080 \
-  -v /data/srs/objs:/usr/local/srs/objs \
+  -v /data/srs:/data/srs \
   harbor.zmg.com.cn/library/newingest-srs:latest
 ```
 
-> `/data/srs/objs` 可替换为宿主机上任意目录。挂载后 `dynamic_ingest.json` / `dynamic_forward.json` 落盘到宿主机，容器重启后规则自动恢复、ffmpeg 进程自动重拉。
+> 挂载 `/data/srs` 后 `dynamic_ingest.json` / `dynamic_forward.json` 持久化到宿主机，容器重启后规则自动恢复、ffmpeg 进程自动重拉。
 
 ---
 

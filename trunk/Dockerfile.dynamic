@@ -25,7 +25,7 @@ listen              1935;
 max_connections     1000;
 daemon              off;
 srs_log_tank        console;
-pid                 /usr/local/srs/objs/srs.pid;
+pid                 /data/srs/srs.pid;
 
 http_api {
     enabled         on;
@@ -43,6 +43,8 @@ vhost __defaultVhost__ {
     }
 }
 EOF
+
+RUN mkdir -p /data/srs
 
 EXPOSE 1935 1985 8080
 
