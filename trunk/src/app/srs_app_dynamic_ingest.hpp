@@ -55,6 +55,7 @@ public:
     srs_error_t start();
     void stop();
     const std::string& id() const { return rule_.id; }
+    bool is_exited() const { return exited_; }
 // Interface ISrsCoroutineHandler.
 public:
     virtual srs_error_t cycle();
@@ -64,6 +65,7 @@ private:
     SrsCoroutine* trd_;
     SrsFFMPEG* ffmpeg_;
     bool stopped_;
+    bool exited_;
 };
 
 // Manages all running ingest workers, reconciles with registry on demand.

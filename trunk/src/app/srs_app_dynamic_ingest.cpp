@@ -15,6 +15,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <cstdio>
 #include <ctime>
 #include <cstdlib>
 #include <algorithm>
@@ -35,6 +36,12 @@ SrsDynamicIngestRegistry::~SrsDynamicIngestRegistry()
 
 std::string SrsDynamicIngestRegistry::generate_id()
 {
+    // Seed once with time+pid for uniqueness across restarts.
+    static bool seeded = false;
+    if (!seeded) {
+        srand((unsigned int)time(NULL) ^ ((unsigned int)getpid() << 16));
+        seeded = true;
+    }
     char buf[17];
     snprintf(buf, sizeof(buf), "%08x%08x", (unsigned int)rand(), (unsigned int)rand());
     return std::string(buf);
@@ -109,13 +116,18 @@ srs_error_t SrsDynamicIngestRegistry::save()
     }
 
     std::string content = root->dumps();
-    std::ofstream f(file_path_.c_str());
+    std::string tmp_path = file_path_ + ".tmp";
+    std::ofstream f(tmp_path.c_str());
     if (!f.is_open()) {
-        return srs_error_new(ERROR_SYSTEM_FILE_OPENE, "open %s for write failed", file_path_.c_str());
+        return srs_error_new(ERROR_SYSTEM_FILE_OPENE, "open %s for write failed", tmp_path.c_str());
     }
     f << content;
+    f.close();
     if (!f.good()) {
-        return srs_error_new(ERROR_SYSTEM_FILE_WRITE, "write %s failed", file_path_.c_str());
+        return srs_error_new(ERROR_SYSTEM_FILE_WRITE, "write %s failed", tmp_path.c_str());
+    }
+    if (rename(tmp_path.c_str(), file_path_.c_str()) != 0) {
+        return srs_error_new(ERROR_SYSTEM_FILE_WRITE, "rename %s to %s failed", tmp_path.c_str(), file_path_.c_str());
     }
     return err;
 }
@@ -126,7 +138,8 @@ srs_error_t SrsDynamicIngestRegistry::add(SrsDynamicIngestRule& rule)
 
     time_t now = time(NULL);
     char buf[32];
-    struct tm* tm_info = gmtime(&now);
+    struct tm tm_buf;
+    struct tm* tm_info = gmtime_r(&now, &tm_buf);
     strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
     rule.created_at = buf;
 
@@ -138,8 +151,13 @@ srs_error_t SrsDynamicIngestRegistry::remove_by_id(const std::string& id)
 {
     for (std::vector<SrsDynamicIngestRule>::iterator it = rules_.begin(); it != rules_.end(); ++it) {
         if (it->id == id) {
+            SrsDynamicIngestRule backup = *it;
             rules_.erase(it);
-            return save();
+            srs_error_t err = save();
+            if (err != srs_success) {
+                rules_.push_back(backup); // rollback on save failure
+            }
+            return err;
         }
     }
     return srs_error_new(ERROR_RTMP_STREAM_NOT_FOUND, "ingest rule id=%s not found", id.c_str());
@@ -153,7 +171,7 @@ std::vector<SrsDynamicIngestRule> SrsDynamicIngestRegistry::query_all()
 // ---- SrsDynamicIngestWorker ----
 
 SrsDynamicIngestWorker::SrsDynamicIngestWorker(const SrsDynamicIngestRule& rule, const std::string& ffmpeg_bin)
-    : rule_(rule), ffmpeg_bin_(ffmpeg_bin), trd_(NULL), ffmpeg_(NULL), stopped_(false)
+    : rule_(rule), ffmpeg_bin_(ffmpeg_bin), trd_(NULL), ffmpeg_(NULL), stopped_(false), exited_(false)
 {
 }
 
@@ -185,66 +203,51 @@ srs_error_t SrsDynamicIngestWorker::cycle()
 {
     srs_error_t err = srs_success;
 
-    while (!stopped_) {
-        if ((err = trd_->pull()) != srs_success) {
-            return srs_error_wrap(err, "dingest worker");
-        }
+    // Initialize ffmpeg argv once; start()/cycle() reuse it on restarts.
+    ffmpeg_ = new SrsFFMPEG(ffmpeg_bin_);
+    ffmpeg_->append_iparam("-re");
+    ffmpeg_->append_iparam("-rw_timeout");
+    ffmpeg_->append_iparam("15000000"); // 15s read timeout (microseconds)
 
-        srs_freep(ffmpeg_);
-        ffmpeg_ = new SrsFFMPEG(ffmpeg_bin_);
-        ffmpeg_->append_iparam("-re");
-        // Disable ffmpeg's own retry; we handle retry in this loop.
-        ffmpeg_->append_iparam("-rw_timeout");
-        ffmpeg_->append_iparam("15000000"); // 15s read timeout (microseconds)
-
-        if ((err = ffmpeg_->initialize(rule_.src_url, rule_.dst_url, SRS_CONSTS_NULL_FILE)) != srs_success) {
-            srs_warn("dingest %s: init ffmpeg failed: %s", rule_.id.c_str(), srs_error_desc(err).c_str());
-            srs_freep(err);
-            srs_usleep(3 * SRS_UTIME_SECONDS);
-            continue;
-        }
-
-        ffmpeg_->set_oformat("flv");
-
-        if ((err = ffmpeg_->initialize_copy()) != srs_success) {
-            srs_warn("dingest %s: init copy failed: %s", rule_.id.c_str(), srs_error_desc(err).c_str());
-            srs_freep(err);
-            srs_usleep(3 * SRS_UTIME_SECONDS);
-            continue;
-        }
-
-        if ((err = ffmpeg_->start()) != srs_success) {
-            srs_warn("dingest %s: start ffmpeg failed: %s", rule_.id.c_str(), srs_error_desc(err).c_str());
-            srs_freep(err);
-            srs_usleep(3 * SRS_UTIME_SECONDS);
-            continue;
-        }
-
-        srs_trace("dingest %s: started, src=%s dst=%s", rule_.id.c_str(),
-            rule_.src_url.c_str(), rule_.dst_url.c_str());
-
-        // Poll until ffmpeg process exits (cycle() uses WNOHANG so returns immediately if running).
-        while (!stopped_) {
-            if ((err = trd_->pull()) != srs_success) {
-                ffmpeg_->fast_stop();
-                return srs_error_wrap(err, "dingest worker interrupted");
-            }
-            srs_error_t e = ffmpeg_->cycle();
-            if (e != srs_success) {
-                // cycle() returns error only when process has exited.
-                srs_warn("dingest %s: ffmpeg exited: %s", rule_.id.c_str(), srs_error_desc(e).c_str());
-                srs_freep(e);
-                break;
-            }
-            // Process still running, sleep a bit before next check.
-            srs_usleep(500 * SRS_UTIME_MILLISECONDS);
-        }
-
-        if (!stopped_) {
-            srs_usleep(3 * SRS_UTIME_SECONDS);
-        }
+    if ((err = ffmpeg_->initialize(rule_.src_url, rule_.dst_url, SRS_CONSTS_NULL_FILE)) != srs_success) {
+        exited_ = true;
+        return srs_error_wrap(err, "dingest init");
+    }
+    ffmpeg_->set_oformat("flv");
+    if ((err = ffmpeg_->initialize_copy()) != srs_success) {
+        exited_ = true;
+        return srs_error_wrap(err, "dingest init_copy");
     }
 
+    srs_trace("dingest %s: initialized, src=%s dst=%s", rule_.id.c_str(),
+        rule_.src_url.c_str(), rule_.dst_url.c_str());
+
+    while (!stopped_) {
+        if ((err = trd_->pull()) != srs_success) {
+            ffmpeg_->fast_stop();
+            exited_ = true;
+            return srs_error_wrap(err, "dingest worker interrupted");
+        }
+
+        // start() is idempotent: no-op if process is running, restarts if it exited.
+        if ((err = ffmpeg_->start()) != srs_success) {
+            srs_warn("dingest %s: start failed: %s", rule_.id.c_str(), srs_error_desc(err).c_str());
+            srs_freep(err);
+            srs_usleep(3 * SRS_UTIME_SECONDS);
+            continue;
+        }
+
+        // cycle() uses WNOHANG to reap the process if it has exited;
+        // only errors on waitpid syscall failure (very rare).
+        if ((err = ffmpeg_->cycle()) != srs_success) {
+            srs_warn("dingest %s: cycle error: %s", rule_.id.c_str(), srs_error_desc(err).c_str());
+            srs_freep(err);
+        }
+
+        srs_usleep(500 * SRS_UTIME_MILLISECONDS);
+    }
+
+    exited_ = true;
     return err;
 }
 
@@ -282,8 +285,19 @@ srs_error_t SrsDynamicIngestManager::start_worker(const SrsDynamicIngestRule& ru
 {
     srs_error_t err = srs_success;
 
-    if (workers_.find(rule.id) != workers_.end()) {
-        return err; // already running
+    if (ffmpeg_bin_.empty()) {
+        return srs_error_new(ERROR_SYSTEM_FILE_NOT_EXISTS, "no ffmpeg binary found, ingest unavailable");
+    }
+
+    // Reap stale worker if the coroutine has already exited naturally.
+    std::map<std::string, SrsDynamicIngestWorker*>::iterator it = workers_.find(rule.id);
+    if (it != workers_.end()) {
+        if (it->second->is_exited()) {
+            srs_freep(it->second);
+            workers_.erase(it);
+        } else {
+            return err; // still running
+        }
     }
 
     SrsDynamicIngestWorker* w = new SrsDynamicIngestWorker(rule, ffmpeg_bin_);
@@ -309,7 +323,14 @@ void SrsDynamicIngestManager::stop_worker(const std::string& id)
 
 bool SrsDynamicIngestManager::is_running(const std::string& id)
 {
-    return workers_.find(id) != workers_.end();
+    std::map<std::string, SrsDynamicIngestWorker*>::iterator it = workers_.find(id);
+    if (it == workers_.end()) return false;
+    if (it->second->is_exited()) {
+        srs_freep(it->second);
+        workers_.erase(it);
+        return false;
+    }
+    return true;
 }
 
 #endif // SRS_FFMPEG_STUB

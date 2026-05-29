@@ -61,4 +61,4 @@ RUN mkdir -p /data/srs
 
 EXPOSE 1935 1985 8080
 
-ENTRYPOINT ["/usr/local/srs/objs/srs", "-c", "/usr/local/srs/conf/srs.conf"]
+ENTRYPOINT ["/bin/sh", "-c", "rm -f /data/srs/srs.pid && exec /usr/local/srs/objs/srs -c /usr/local/srs/conf/srs.conf"]
